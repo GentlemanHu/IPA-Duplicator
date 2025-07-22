@@ -1,0 +1,245 @@
+name: IPA Duplicator - Universal App Cloner
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct URL to the IPA file you want to duplicate"
+        default: ""
+        required: true
+        type: string
+      original_bundle_id:
+        description: "Original bundle ID of the app (e.g., com.tencent.xin for WeChat)"
+        default: ""
+        required: true
+        type: string
+      new_bundle_id:
+        description: "New bundle ID for the duplicated app (e.g., com.tencent.xin.dual)"
+        default: ""
+        required: true
+        type: string
+      app_name:
+        description: "Display name for the duplicated app"
+        default: ""
+        required: true
+        type: string
+      app_suffix:
+        description: "Suffix to add to original app name (if app_name is empty)"
+        default: " Dual"
+        required: false
+        type: string
+      version_suffix:
+        description: "Suffix to add to version (optional)"
+        default: "-dual"
+        required: false
+        type: string
+      create_release:
+        description: "Create a GitHub release"
+        default: true
+        required: false
+        type: boolean
+      upload_artifact:
+        description: "Upload as artifact"
+        default: true
+        required: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  duplicate_ipa:
+    name: Duplicate IPA
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      original_version: ${{ steps.extract_info.outputs.original_version }}
+      original_name: ${{ steps.extract_info.outputs.original_name }}
+      new_name: ${{ steps.extract_info.outputs.new_name }}
+      package_name: ${{ steps.build_package.outputs.package_name }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          brew install ldid
+          # Create working directory
+          mkdir -p work/Payload
+
+      - name: Download Original IPA
+        run: |
+          echo "Downloading IPA from: ${{ inputs.ipa_url }}"
+          curl -L "${{ inputs.ipa_url }}" -o work/original.ipa
+          
+      - name: Extract IPA
+        run: |
+          cd work
+          unzip -q original.ipa
+          
+      - name: Extract App Information
+        id: extract_info
+        run: |
+          cd work
+          # Find the app bundle
+          APP_PATH=$(find Payload -name "*.app" -type d | head -1)
+          echo "Found app at: $APP_PATH"
+          
+          # Extract information from Info.plist
+          original_version=$(defaults read "$(pwd)/$APP_PATH/Info" CFBundleVersion 2>/dev/null || echo "1.0")
+          original_short_version=$(defaults read "$(pwd)/$APP_PATH/Info" CFBundleShortVersionString 2>/dev/null || echo "1.0")
+          original_name=$(defaults read "$(pwd)/$APP_PATH/Info" CFBundleDisplayName 2>/dev/null || defaults read "$(pwd)/$APP_PATH/Info" CFBundleName 2>/dev/null || echo "App")
+          original_bundle_id=$(defaults read "$(pwd)/$APP_PATH/Info" CFBundleIdentifier)
+          
+          echo "==> Original App Info:"
+          echo "Name: $original_name"
+          echo "Version: $original_short_version ($original_version)"
+          echo "Bundle ID: $original_bundle_id"
+          
+          # Determine new app name
+          if [ -n "${{ inputs.app_name }}" ]; then
+            new_name="${{ inputs.app_name }}"
+          else
+            new_name="$original_name${{ inputs.app_suffix }}"
+          fi
+          
+          echo "==> New App Info:"
+          echo "Name: $new_name"
+          echo "Bundle ID: ${{ inputs.new_bundle_id }}"
+          
+          # Output for next steps
+          echo "original_version=$original_version" >> $GITHUB_OUTPUT
+          echo "original_short_version=$original_short_version" >> $GITHUB_OUTPUT
+          echo "original_name=$original_name" >> $GITHUB_OUTPUT
+          echo "new_name=$new_name" >> $GITHUB_OUTPUT
+          echo "original_bundle_id=$original_bundle_id" >> $GITHUB_OUTPUT
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+
+      - name: Modify App Bundle
+        run: |
+          cd work
+          APP_PATH="${{ steps.extract_info.outputs.app_path }}"
+          
+          echo "==> Modifying $APP_PATH/Info.plist"
+          
+          # Backup original Info.plist
+          cp "$APP_PATH/Info.plist" "$APP_PATH/Info.plist.backup"
+          
+          # Modify bundle identifier
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${{ inputs.new_bundle_id }}" "$APP_PATH/Info.plist"
+          
+          # Modify display name
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${{ steps.extract_info.outputs.new_name }}" "$APP_PATH/Info.plist" 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string ${{ steps.extract_info.outputs.new_name }}" "$APP_PATH/Info.plist"
+          
+          # Modify app name if exists
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName ${{ steps.extract_info.outputs.new_name }}" "$APP_PATH/Info.plist" 2>/dev/null || true
+          
+          # Add version suffix if specified
+          if [ -n "${{ inputs.version_suffix }}" ]; then
+            current_version="${{ steps.extract_info.outputs.original_version }}"
+            new_version="$current_version${{ inputs.version_suffix }}"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $new_version" "$APP_PATH/Info.plist"
+          fi
+          
+          echo "==> Modified Info.plist:"
+          plutil -p "$APP_PATH/Info.plist" | grep -E "(CFBundleIdentifier|CFBundleDisplayName|CFBundleName|CFBundleVersion)"
+
+      - name: Remove Code Signature
+        run: |
+          cd work
+          APP_PATH="${{ steps.extract_info.outputs.app_path }}"
+          
+          echo "==> Removing existing code signature"
+          rm -rf "$APP_PATH/_CodeSignature" 2>/dev/null || true
+          rm -rf "$APP_PATH/CodeResources" 2>/dev/null || true
+          
+          # Remove any existing provisioning profiles
+          find "$APP_PATH" -name "*.mobileprovision" -delete 2>/dev/null || true
+
+      - name: Create New IPA
+        id: build_package
+        run: |
+          cd work
+          
+          # Generate new filename
+          original_name_safe=$(echo "${{ steps.extract_info.outputs.original_name }}" | sed 's/[^a-zA-Z0-9]/_/g')
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          package_name="${original_name_safe}_Dual_v${{ steps.extract_info.outputs.original_version }}_${timestamp}.ipa"
+          
+          echo "==> Creating new IPA: $package_name"
+          
+          # Create the new IPA
+          zip -r "$package_name" Payload/ -q
+          
+          # Calculate file info
+          file_size=$(ls -lh "$package_name" | awk '{print $5}')
+          sha256_hash=$(shasum -a 256 "$package_name" | cut -f1 -d' ')
+          
+          echo "==> Build completed successfully!"
+          echo "File: $package_name"
+          echo "Size: $file_size"
+          echo "SHA256: $sha256_hash"
+          echo "Original Bundle ID: ${{ steps.extract_info.outputs.original_bundle_id }}"
+          echo "New Bundle ID: ${{ inputs.new_bundle_id }}"
+          
+          # Output for next steps
+          echo "package_name=$package_name" >> $GITHUB_OUTPUT
+
+      - name: Upload Artifact
+        if: ${{ inputs.upload_artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build_package.outputs.package_name }}
+          path: work/${{ steps.build_package.outputs.package_name }}
+          if-no-files-found: error
+
+      - name: Create Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.extract_info.outputs.original_name }}-dual-${{ github.run_number }}
+          name: ${{ steps.extract_info.outputs.new_name }} v${{ steps.extract_info.outputs.original_version }}
+          body: |
+            ## 📱 App Duplication Successful
+            
+            **Original App**: ${{ steps.extract_info.outputs.original_name }}
+            **New App**: ${{ steps.extract_info.outputs.new_name }}
+            **Version**: ${{ steps.extract_info.outputs.original_version }}
+            
+            **Bundle ID Changes**:
+            - From: `${{ steps.extract_info.outputs.original_bundle_id }}`
+            - To: `${{ inputs.new_bundle_id }}`
+            
+            ## 🚀 Installation Instructions
+            
+            1. Download the IPA file below
+            2. Install via AltStore:
+               - Open AltStore on your device
+               - Tap the "+" button
+               - Select the downloaded IPA file
+               - Enter your Apple ID credentials when prompted
+            
+            ## ⚠️ Important Notes
+            
+            - This is an unsigned IPA file, suitable for sideloading
+            - You'll need to refresh the app every 7 days (free Apple ID) or 1 year (paid developer account)
+            - Both the original and duplicated app can coexist on the same device
+            
+            ## 🔄 Auto-Refresh
+            
+            To enable auto-refresh in AltStore:
+            - Keep AltServer running on your computer
+            - Ensure your device is on the same Wi-Fi network
+            - Enable "Background App Refresh" for AltStore
+            
+            ---
+            
+            Built with ❤️ using GitHub Actions
+          files: work/${{ steps.build_package.outputs.package_name }}
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
